@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+cmake-build-*/
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.pdb
+
+# Editor and OS files
+.vscode/
+.idea/
+.vs/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local server configuration (never commit your own settings)
+*.conf
+!*.conf.dist

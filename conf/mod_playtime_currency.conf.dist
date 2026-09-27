@@ -1,0 +1,48 @@
+###############################################################################
+# Playtime currency module
+#
+# Pays a token item to every online account on a fixed interval, scaled by how
+# much playtime the character has accumulated, plus optional one-off milestone
+# gifts. Rewards are always delivered by mail, so a full bag never blocks a
+# payout, and players can collect them with a right click.
+#
+# All options are reloadable through the worldserver config reload.
+###############################################################################
+
+[Worldserver]
+
+# Enable/disable the whole module.
+PlaytimeCurrency.Enable = 1
+
+# Item entry of the currency token. It must exist in item_template; the module
+# ships a ready to use one (entry 95501) in data/sql/db-world.
+PlaytimeCurrency.TokenItemEntry = 95501
+
+# How often the reward is paid while online, in minutes. 0 disables the module.
+PlaytimeCurrency.IntervalMinutes = 15
+
+# Maximum tokens granted per account per day, which is what keeps idle
+# accounts from farming. 0 disables the module.
+PlaytimeCurrency.DailyCap = 40
+
+# Progressive payout: "hoursPlayed:tokensPerInterval,..."
+# A character with 10h or more of total playtime earns 2 tokens per interval.
+# Leave it empty to always pay a flat 1 token per interval.
+PlaytimeCurrency.ProgressiveTiers = "10:2,50:3,120:4"
+
+# One-off milestone gifts: "hoursPlayed:itemEntry,..."
+# Granted once per character the first time that character is online after
+# reaching the threshold. Leave it empty to disable milestone rewards.
+# Example: "10:45577,50:45574,120:45575"
+PlaytimeCurrency.Milestones = ""
+
+# Subject and body of the periodic reward mail.
+PlaytimeCurrency.RewardMailSubject = "Playtime reward"
+PlaytimeCurrency.RewardMailBody = "Thank you for playing. Here are your tokens."
+
+# Subject and body of the milestone gift mail.
+PlaytimeCurrency.MilestoneMailSubject = "Playtime milestone reached"
+PlaytimeCurrency.MilestoneMailBody = "Thank you for sticking around. Here is a gift for your dedication."
+
+# Extra logging for admins: one line per interval tick and per milestone.
+PlaytimeCurrency.Debug = 0
