@@ -76,8 +76,14 @@ namespace
 
         // Works for offline characters too: the mail is addressed by low guid.
         Player* online = player->IsConnected() ? player->GetConnectedPlayer() : nullptr;
-        manager.MailItem(player->GetGUID().GetCounter(), online, manager.GetTokenEntry(), amount,
-            "Playtime currency granted", "Granted by a game master.");
+        if (!manager.MailItem(player->GetGUID().GetCounter(), online, manager.GetTokenEntry(), amount,
+            "Playtime currency granted", "Granted by a game master."))
+        {
+            handler->SendSysMessage(Acore::StringFormat(
+                "Playtime currency: item {} does not exist, nothing was mailed to {}.", manager.GetTokenEntry(),
+                player->GetName()));
+            return false;
+        }
 
         handler->SendSysMessage(Acore::StringFormat("Playtime currency: granted {} token(s) to {}.", amount,
             player->GetName()));

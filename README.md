@@ -81,6 +81,30 @@ start and says so in the log, rather than silently doing nothing.
 Malformed entries in the tier or milestone lists are skipped with a warning, so
 one typo does not take the whole config down.
 
+Milestones are scanned on their own one minute timer, so a character that just
+crossed a threshold gets the gift within a minute instead of waiting for the
+next payout. The interval itself is capped at 24 hours, because it is stored in
+milliseconds and a larger value would overflow.
+
+## A note on the SQL
+
+AzerothCore has a prepared statement system, but the statement lists live in
+core side enums that a module cannot extend without patching core, and patching
+core would break the "clone it into `modules/` and build" promise. So the two
+statements here are plain SQL, and the module is built so the payout path
+almost never reads:
+
+- one query to load the day's ledger, when the day changes
+- one query the first time a character is seen, to cache its milestone claims
+- everything else is an in-memory lookup, and the writes go through
+  `CommitTransaction`, which is queued on the database thread
+
+That is also why the world update thread never waits on the database here. The
+elapsed time is compared in a `uint64` so a lag spike cannot wrap the timer.
+
+Keep the worldserver and the database in the same timezone: the day rollover is
+detected from the server clock while the ledger is keyed by `CURDATE()`.
+
 ## Commands
 
 `.playtime status` shows the player what they have earned today, what the next

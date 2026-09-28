@@ -32,23 +32,70 @@
 #include "Item.h"
 #include "Log.h"
 #include "Mail.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "StringFormat.h"
+#include "Util.h"
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
 
 #include <algorithm>
+#include <ctime>
 #include <sstream>
-#include <unordered_map>
 
 namespace
 {
     // AzerothCore keeps its prepared statements in a core side enum a module
-    // cannot extend, so the two ledger statements below are the only SQL built
-    // at runtime. Every interpolated value is an integer this module produced
-    // itself, so there is nothing user supplied to escape.
+    // cannot extend, so these statements are plain SQL. That is why the payout
+    // path is built so that it almost never reads: the ledger and the milestone
+    // claims are cached in memory, and the two queries that fill those caches
+    // run through AsyncQuery, off the world update thread. Every interpolated
+    // value is an integer this module produced, so there is nothing to escape.
     constexpr char const* REWARDS_TABLE = "playtime_currency_rewards";
     constexpr char const* MILESTONES_TABLE = "playtime_currency_milestones";
+
+    // Milestones are scanned on their own timer instead of on the payout tick,
+    // so a character that just crossed a threshold gets the gift within a
+    // minute rather than waiting for the next interval.
+    constexpr uint32 MILESTONE_CHECK_INTERVAL_MS = 60 * 1000;
+
+    // Appends a mail to a transaction. Returns false when the item does not
+    // exist, so the caller can skip recording a reward that was never sent.
+    bool AppendMail(CharacterDatabaseTransaction trans, ObjectGuid::LowType characterGuid, Player* player,
+        uint32 itemEntry, uint32 amount, std::string const& subject, std::string const& body)
+    {
+        Item* item = Item::CreateItem(itemEntry, amount, player);
+        if (!item)
+        {
+            LOG_ERROR("module.playtime_currency", "Item {} is missing from item_template, no mail was created.",
+                itemEntry);
+            return false;
+        }
+
+        // A mail with a body is a normal mail: the client already lets the
+        // player take the items straight from it, no extra flag needed.
+        MailDraft(subject, body)
+            .AddItem(item)
+            .SendMailTo(trans, player ? MailReceiver(player) : MailReceiver(characterGuid),
+                player ? MailSender(player) : MailSender(static_cast<uint32>(0)), MAIL_CHECK_MASK_HAS_BODY);
+        return true;
+    }
+
+    void AppendTokens(CharacterDatabaseTransaction trans, uint32 accountId, uint32 amount)
+    {
+        trans->Append(Acore::StringFormat(
+            "INSERT INTO `{}` (`account_id`, `reward_date`, `tokens`) VALUES ({}, CURDATE(), {}) "
+            "ON DUPLICATE KEY UPDATE `tokens` = `tokens` + VALUES(`tokens`)",
+            REWARDS_TABLE, accountId, amount));
+    }
+
+    void AppendMilestoneClaim(CharacterDatabaseTransaction trans, uint32 characterGuid, uint32 hours)
+    {
+        trans->Append(Acore::StringFormat(
+            "INSERT INTO `{}` (`character_guid`, `milestone_hours`) VALUES ({}, {}) "
+            "ON DUPLICATE KEY UPDATE `milestone_hours` = `milestone_hours`",
+            MILESTONES_TABLE, characterGuid, hours));
+    }
 }
 
 namespace PlaytimeCurrency
@@ -57,6 +104,19 @@ namespace PlaytimeCurrency
     {
         static Manager instance;
         return instance;
+    }
+
+    uint64 Manager::MakeMilestoneKey(uint32 characterGuid, uint32 hours)
+    {
+        return (static_cast<uint64>(characterGuid) << 32) | hours;
+    }
+
+    std::string Manager::GetCurrentDay()
+    {
+        // Has to match the timezone of the database, because the ledger is
+        // keyed by CURDATE() on the MySQL side. Keep the worldserver and the
+        // database in the same timezone.
+        return secsToTimeString(static_cast<uint64>(time(nullptr))).substr(0, 10);
     }
 
     std::vector<Tier> Manager::ParseTiers(std::string const& raw)
@@ -108,7 +168,7 @@ namespace PlaytimeCurrency
         return milestones;
     }
 
-    void Manager::LoadConfig()
+    void Manager::LoadConfig(bool validateItems)
     {
         _enabled = sConfigMgr->GetOption<bool>("PlaytimeCurrency.Enable", true);
         _debug = sConfigMgr->GetOption<bool>("PlaytimeCurrency.Debug", false);
@@ -146,8 +206,45 @@ namespace PlaytimeCurrency
             _enabled = false;
         }
 
+        // The interval is stored in milliseconds, so the multiplication below
+        // has to stay inside a uint32. A big configured value would wrap
+        // around and leave a nonsense interval, either paying on every tick or
+        // never paying at all, so cap it at a day.
+        constexpr uint32 MAX_INTERVAL_MINUTES = 24 * 60;
+        if (intervalMinutes > MAX_INTERVAL_MINUTES)
+        {
+            LOG_ERROR("module.playtime_currency",
+                "PlaytimeCurrency.IntervalMinutes {} is above the maximum of {}, clamping it.", intervalMinutes,
+                MAX_INTERVAL_MINUTES);
+            intervalMinutes = MAX_INTERVAL_MINUTES;
+        }
+
+        // Catch a bad item entry at startup instead of silently never paying.
+        // item_template is not loaded when the config is read, so the config
+        // reload pass skips this and OnStartup does the real check.
+        if (validateItems && _enabled && !sObjectMgr->GetItemTemplate(_tokenEntry))
+        {
+            LOG_ERROR("module.playtime_currency",
+                "PlaytimeCurrency.TokenItemEntry {} does not exist in item_template, disabling the module.",
+                _tokenEntry);
+            _enabled = false;
+        }
+
+        for (Milestone const& milestone : _milestones)
+            if (validateItems && !sObjectMgr->GetItemTemplate(milestone.ItemEntry))
+                LOG_ERROR("module.playtime_currency",
+                    "Milestone {}h points at item {}, which does not exist in item_template, it will never be granted.",
+                    milestone.Hours, milestone.ItemEntry);
+
         _intervalMs = intervalMinutes * 60 * 1000;
         _msSinceLastTick = 0;
+
+        // A reload rebuilds the caches, they have to be fetched again.
+        _ledgerLoaded = false;
+        _ledgerDay.clear();
+        _tokensToday.clear();
+        _claimedMilestones.clear();
+        _loadedCharacters.clear();
 
         LOG_INFO("module.playtime_currency",
             "Playtime currency: enabled {}, item {}, interval {} min, daily cap {} per account, {} tier(s), {} milestone(s)",
@@ -162,22 +259,94 @@ namespace PlaytimeCurrency
         return _intervalMs - std::min(_msSinceLastTick, _intervalMs);
     }
 
+    void Manager::RefreshDailyLedger()
+    {
+        std::string day = GetCurrentDay();
+        if (_ledgerDay == day && _ledgerLoaded)
+            return;
+
+        _ledgerDay = day;
+        _tokensToday.clear();
+        _ledgerLoaded = false;
+
+        // One query for the whole realm, on the database thread.
+        CharacterDatabase.AsyncQuery(Acore::StringFormat(
+            "SELECT `account_id`, `tokens` FROM `{}` WHERE `reward_date` = CURDATE()", REWARDS_TABLE))
+            .WithCallback([this](QueryResult result)
+            {
+                if (result)
+                {
+                    do
+                    {
+                        Field* fields = result->Fetch();
+                        _tokensToday[fields[0].Get<uint32>()] = fields[1].Get<uint32>();
+                    } while (result->NextRow());
+                }
+
+                _ledgerLoaded = true;
+
+                if (_debug)
+                    LOG_DEBUG("module.playtime_currency", "Daily ledger loaded: {} account(s) with a payout today.",
+                        _tokensToday.size());
+            });
+    }
+
+    void Manager::LoadCharacterClaims(uint32 characterGuid)
+    {
+        _loadedCharacters.insert(characterGuid);
+
+        CharacterDatabase.AsyncQuery(Acore::StringFormat(
+            "SELECT `milestone_hours` FROM `{}` WHERE `character_guid` = {}", MILESTONES_TABLE, characterGuid))
+            .WithCallback([this, characterGuid](QueryResult result)
+            {
+                if (result)
+                {
+                    do
+                    {
+                        Field* fields = result->Fetch();
+                        _claimedMilestones.insert(MakeMilestoneKey(characterGuid, fields[0].Get<uint32>()));
+                    } while (result->NextRow());
+                }
+
+                if (_debug)
+                    LOG_DEBUG("module.playtime_currency", "Loaded {} milestone claim(s) for character {}.",
+                        result ? result->GetRowCount() : 0, characterGuid);
+            });
+    }
+
     void Manager::Tick(uint32 diff)
     {
         if (!_enabled)
             return;
 
         // Counting elapsed intervals instead of resetting the timer keeps the
-        // schedule stable after a lag spike, without unbounded loops.
-        _msSinceLastTick += diff;
-        if (_msSinceLastTick < _intervalMs)
+        // schedule stable after a lag spike, without unbounded loops. The sum
+        // is done in a uint64 so a long stall cannot wrap the accumulator and
+        // leave the timer stuck short of the interval forever.
+        uint64 elapsed = static_cast<uint64>(_msSinceLastTick) + diff;
+        if (elapsed < _intervalMs)
+        {
+            _msSinceLastTick = static_cast<uint32>(elapsed);
             return;
+        }
 
-        uint32 dueIntervals = _msSinceLastTick / _intervalMs;
-        _msSinceLastTick %= _intervalMs;
+        uint32 dueIntervals = static_cast<uint32>(elapsed / _intervalMs);
+        _msSinceLastTick = static_cast<uint32>(elapsed % _intervalMs);
 
         for (uint32 interval = 0; interval < dueIntervals; ++interval)
             PayDueRewards();
+
+        // Milestones are checked on their own timer, not on the payout tick, so
+        // a character that just crossed a threshold does not wait a full
+        // interval for the gift.
+        uint64 elapsedCheck = static_cast<uint64>(_msSinceMilestoneCheck) + diff;
+        if (elapsedCheck >= MILESTONE_CHECK_INTERVAL_MS)
+        {
+            _msSinceMilestoneCheck = static_cast<uint32>(elapsedCheck % MILESTONE_CHECK_INTERVAL_MS);
+            CheckOnlineMilestones();
+        }
+        else
+            _msSinceMilestoneCheck = static_cast<uint32>(elapsedCheck);
     }
 
     uint32 Manager::GetTokensPerInterval(uint32 playedHours) const
@@ -202,16 +371,27 @@ namespace PlaytimeCurrency
 
     uint32 Manager::GetTokensGrantedToday(uint32 accountId) const
     {
-        QueryResult result = CharacterDatabase.Query(Acore::StringFormat(
-            "SELECT `tokens` FROM `{}` WHERE `account_id` = {} AND `reward_date` = CURDATE()", REWARDS_TABLE, accountId));
-        if (!result)
-            return 0;
+        auto const itr = _tokensToday.find(accountId);
+        return itr != _tokensToday.end() ? itr->second : 0;
+    }
 
-        return (*result)[0].Get<uint32>();
+    bool Manager::IsMilestoneClaimed(uint32 characterGuid, uint32 hours) const
+    {
+        return _claimedMilestones.contains(MakeMilestoneKey(characterGuid, hours));
     }
 
     void Manager::PayDueRewards()
     {
+        // The cache fills asynchronously, and paying without it would blow
+        // through the daily cap, so wait for the first load.
+        RefreshDailyLedger();
+        if (!_ledgerLoaded)
+        {
+            if (_debug)
+                LOG_DEBUG("module.playtime_currency", "Interval tick: waiting for the daily ledger, nothing paid.");
+            return;
+        }
+
         // One payout per account per interval, no matter how many of its
         // characters are online: the per character tier rewards are summed and
         // delivered as a single mail.
@@ -244,18 +424,18 @@ namespace PlaytimeCurrency
             if (!receiver)
                 continue;
 
-            MailItem(receiver->GetGUID().GetCounter(), receiver, _tokenEntry, count, _rewardSubject, _rewardBody);
-            RecordTokens(accountId, count);
-            ++paidAccounts;
-        }
+            // Mail and ledger move together, so a crash can never pay a
+            // reward that was not sent, nor send one that was not counted.
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            if (!AppendMail(trans, receiver->GetGUID().GetCounter(), receiver, _tokenEntry, count, _rewardSubject,
+                _rewardBody))
+                continue;
 
-        // Milestones are checked on every tick too, so a player that just
-        // crossed a threshold does not wait a full interval for the gift.
-        for (auto const& [accountId, session] : sWorldSessionMgr->GetAllSessions())
-        {
-            Player* player = session->GetPlayer();
-            if (player && player->IsInWorld())
-                CheckMilestones(player);
+            AppendTokens(trans, accountId, count);
+            CharacterDatabase.CommitTransaction(trans);
+
+            _tokensToday[accountId] = grantedToday + count;
+            ++paidAccounts;
         }
 
         if (_debug)
@@ -263,13 +443,17 @@ namespace PlaytimeCurrency
                 paidAccounts);
     }
 
-    bool Manager::IsMilestoneClaimed(uint32 characterGuid, uint32 hours) const
+    void Manager::CheckOnlineMilestones()
     {
-        QueryResult result = CharacterDatabase.Query(Acore::StringFormat(
-            "SELECT 1 FROM `{}` WHERE `character_guid` = {} AND `milestone_hours` = {} LIMIT 1", MILESTONES_TABLE,
-            characterGuid, hours));
+        if (_milestones.empty())
+            return;
 
-        return result && result->Fetch()[0].Get<uint32>() == 1;
+        for (auto const& [accountId, session] : sWorldSessionMgr->GetAllSessions())
+        {
+            Player* player = session->GetPlayer();
+            if (player && player->IsInWorld())
+                CheckMilestones(player);
+        }
     }
 
     void Manager::CheckMilestones(Player* player)
@@ -277,8 +461,17 @@ namespace PlaytimeCurrency
         if (_milestones.empty() || !player)
             return;
 
-        uint32 playedHours = player->GetTotalPlayedTime() / 3600;
         uint32 characterGuid = player->GetGUID().GetCounter();
+
+        // The claims of this character are still being fetched: ask once and
+        // look again on the next tick.
+        if (!_loadedCharacters.contains(characterGuid))
+        {
+            LoadCharacterClaims(characterGuid);
+            return;
+        }
+
+        uint32 playedHours = player->GetTotalPlayedTime() / 3600;
 
         for (Milestone const& milestone : _milestones)
         {
@@ -288,33 +481,20 @@ namespace PlaytimeCurrency
             if (IsMilestoneClaimed(characterGuid, milestone.Hours))
                 continue;
 
-            MailItem(characterGuid, player, milestone.ItemEntry, 1, _milestoneSubject, _milestoneBody);
-            RecordMilestone(characterGuid, milestone.Hours);
+            // Gift and claim share one transaction, and the claim is only
+            // recorded when the mail really was created.
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            if (!AppendMail(trans, characterGuid, player, milestone.ItemEntry, 1, _milestoneSubject, _milestoneBody))
+                continue;
+
+            AppendMilestoneClaim(trans, characterGuid, milestone.Hours);
+            CharacterDatabase.CommitTransaction(trans);
+            _claimedMilestones.insert(MakeMilestoneKey(characterGuid, milestone.Hours));
 
             if (_debug)
-                LOG_DEBUG("module.playtime_currency", "Milestone {}h claimed by character {}.", milestone.Hours,
+                LOG_DEBUG("module.playtime_currency", "Milestone {}h granted to character {}.", milestone.Hours,
                     characterGuid);
         }
-    }
-
-    void Manager::RecordTokens(uint32 accountId, uint32 amount) const
-    {
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        trans->Append(Acore::StringFormat(
-            "INSERT INTO `{}` (`account_id`, `reward_date`, `tokens`) VALUES ({}, CURDATE(), {}) "
-            "ON DUPLICATE KEY UPDATE `tokens` = `tokens` + VALUES(`tokens`)",
-            REWARDS_TABLE, accountId, amount));
-        CharacterDatabase.CommitTransaction(trans);
-    }
-
-    void Manager::RecordMilestone(uint32 characterGuid, uint32 hours) const
-    {
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        trans->Append(Acore::StringFormat(
-            "INSERT INTO `{}` (`character_guid`, `milestone_hours`) VALUES ({}, {}) "
-            "ON DUPLICATE KEY UPDATE `milestone_hours` = `milestone_hours`",
-            MILESTONES_TABLE, characterGuid, hours));
-        CharacterDatabase.CommitTransaction(trans);
     }
 
     void Manager::MailTokens(Player* player, uint32 amount)
@@ -325,24 +505,21 @@ namespace PlaytimeCurrency
         MailItem(player->GetGUID().GetCounter(), player, _tokenEntry, amount, _rewardSubject, _rewardBody);
     }
 
-    void Manager::MailItem(ObjectGuid::LowType characterGuid, Player* player, uint32 itemEntry, uint32 amount,
+    bool Manager::MailItem(ObjectGuid::LowType characterGuid, Player* player, uint32 itemEntry, uint32 amount,
         std::string const& subject, std::string const& body)
     {
-        Item* item = Item::CreateItem(itemEntry, amount, player);
-        if (!item)
+        if (!characterGuid)
         {
-            LOG_ERROR("module.playtime_currency", "Item {} is missing from item_template, nothing was mailed.", itemEntry);
-            return;
+            LOG_ERROR("module.playtime_currency", "Refusing to mail item {} to an invalid character guid.", itemEntry);
+            return false;
         }
 
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        // A mail with a body is a normal mail: the client already lets the
-        // player take the items straight from it, no extra flag needed.
-        MailDraft(subject, body)
-            .AddItem(item)
-            .SendMailTo(trans, player ? MailReceiver(player) : MailReceiver(characterGuid),
-                player ? MailSender(player) : MailSender(static_cast<uint32>(0)), MAIL_CHECK_MASK_HAS_BODY);
+        if (!AppendMail(trans, characterGuid, player, itemEntry, amount, subject, body))
+            return false;
+
         CharacterDatabase.CommitTransaction(trans);
+        return true;
     }
 
     std::string Manager::BuildStatus(Player* player) const
@@ -374,7 +551,9 @@ namespace PlaytimeCurrency
 
 void playtime_currency_WorldScript::OnAfterConfigLoad(bool /*reload*/)
 {
-    PlaytimeCurrency::Manager::Instance().LoadConfig();
+    // item_template is not loaded yet at this point, so the item check waits
+    // for OnStartup.
+    PlaytimeCurrency::Manager::Instance().LoadConfig(false);
 }
 
 void playtime_currency_WorldScript::OnStartup()

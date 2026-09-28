@@ -33,6 +33,8 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class ChatHandler;
@@ -56,12 +58,21 @@ namespace PlaytimeCurrency
 
     // Holds the configuration and pays the rewards. Single instance, created on
     // first use, so the world script and the command script share one state.
+    //
+    // Everything the payout path needs to read is cached in memory, so the
+    // world update thread never waits on the database. The database is only
+    // touched asynchronously: one query to load the daily ledger when the day
+    // changes, one per character the first time that character is seen, and
+    // non-blocking transactions to write.
     class Manager
     {
     public:
         static Manager& Instance();
 
-        void LoadConfig();
+        // validateItems checks the configured items against item_template, which
+        // is only loaded once the world is up, so the config reload pass has to
+        // pass false.
+        void LoadConfig(bool validateItems = true);
 
         // Drives the interval timer and pays whatever became due.
         void Tick(uint32 diff);
@@ -75,15 +86,17 @@ namespace PlaytimeCurrency
         std::vector<Milestone> const& GetMilestones() const { return _milestones; }
 
         uint32 GetTokensPerInterval(uint32 playedHours) const;
-        uint32 GetTokensGrantedToday(uint32 accountId) const;
         uint32 GetNextTierHours(uint32 playedHours) const;
+        uint32 GetTokensGrantedToday(uint32 accountId) const;
 
         // Mails tokens to a player, ignoring the daily cap. Used by the
         // interval payout, the milestone gifts and the GM command.
         void MailTokens(Player* player, uint32 amount);
         // Mails an item to a character that is online (player != nullptr) or
-        // only known by its low guid (offline).
-        void MailItem(ObjectGuid::LowType characterGuid, Player* player, uint32 itemEntry, uint32 amount,
+        // only known by its low guid (offline). Returns false when the item
+        // does not exist, so callers do not record a reward that was never
+        // delivered.
+        bool MailItem(ObjectGuid::LowType characterGuid, Player* player, uint32 itemEntry, uint32 amount,
             std::string const& subject, std::string const& body);
 
         // Grants every milestone gift a character reached but has not claimed.
@@ -98,9 +111,15 @@ namespace PlaytimeCurrency
 
         // Pays one interval to every account with online characters.
         void PayDueRewards();
-        void RecordTokens(uint32 accountId, uint32 amount) const;
-        void RecordMilestone(uint32 characterGuid, uint32 hours) const;
+        // Walks the online characters looking for unclaimed milestones.
+        void CheckOnlineMilestones();
+        // Loads today's ledger with a single query when the day rolls over.
+        void RefreshDailyLedger();
+        // Loads the claims of a character the first time it is seen.
+        void LoadCharacterClaims(uint32 characterGuid);
 
+        static std::string GetCurrentDay();
+        static uint64 MakeMilestoneKey(uint32 characterGuid, uint32 hours);
         static std::vector<Tier> ParseTiers(std::string const& raw);
         static std::vector<Milestone> ParseMilestones(std::string const& raw);
 
@@ -110,12 +129,22 @@ namespace PlaytimeCurrency
         uint32 _intervalMs = 0;
         uint32 _dailyCap = 0;
         uint32 _msSinceLastTick = 0;
+        uint32 _msSinceMilestoneCheck = 0;
         std::string _rewardSubject;
         std::string _rewardBody;
         std::string _milestoneSubject;
         std::string _milestoneBody;
         std::vector<Tier> _tiers;
         std::vector<Milestone> _milestones;
+
+        // account -> tokens already paid today.
+        std::unordered_map<uint32, uint32> _tokensToday;
+        // (character, hours) pairs already granted.
+        std::unordered_set<uint64> _claimedMilestones;
+        // Characters whose claims are cached.
+        std::unordered_set<uint32> _loadedCharacters;
+        std::string _ledgerDay;
+        bool _ledgerLoaded = false;
     };
 }
 
